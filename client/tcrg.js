@@ -1,19 +1,19 @@
-const WASM_URL = 'tcrg.wasm';
-const TRANSPORT_URL = 'https://localhost:9000';
 let wasmModulePromise = null;
 
 export class TcrgClient extends EventTarget {
   #wasmUrl;
   #transportUrl;
+  #hash;
   #tcrg = null;
   #transport = null;
   #abortController = null;
   #isListening = false;
 
-  constructor(wasmUrl, transportUrl) {
+  constructor(wasmUrl, transportUrl, certHex) {
     super();
     this.#wasmUrl = wasmUrl;
     this.#transportUrl = transportUrl;
+    this.#hash = new Uint8Array(certHex.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
   }
 
   async open() {
@@ -36,7 +36,8 @@ export class TcrgClient extends EventTarget {
       const wasmResult = await WebAssembly.instantiate(module);
       this.#tcrg = wasmResult.instance;
 
-      this.#transport = new WebTransport(this.#transportUrl); 
+      const sha256 = { algorithm: "sha-256", value: this.#hash.buffer, };
+      this.#transport = new WebTransport(this.#transportUrl, { serverCertificateHashes: [sha256] }); 
       await this.#transport.ready;
 
       if(this.#abortController.signal.aborted) {
@@ -59,14 +60,6 @@ export class TcrgClient extends EventTarget {
   }
 
   async #ingest() {
-    // changes to make
-    // i have a js owned arraybuffer(BUF_CAP) 
-    // and a wasm owned view (BUF_CAP)
-    // and after i receive "value" which is just that filled arraybuffer, 
-    // i copy my "value" bytes into the wasm owned view, 
-    // accounting for an offset 
-    // until the byob read returns done === true
-
     const exports = this.#tcrg.exports;
     const bufPtr = exports.tcrg_get_buf();
     const bufCap = exports.tcrg_get_buf_cap();
