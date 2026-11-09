@@ -1,6 +1,6 @@
 const WASM_URL = 'tcrg.wasm';
 const TRANSPORT_URL = 'https://localhost:9000';
-let tcrg = null;
+let wasmModulePromise = null;
 
 export class TcrgClient extends EventTarget {
   #wasmUrl;
@@ -24,22 +24,27 @@ export class TcrgClient extends EventTarget {
     this.#abortController = new AbortController();
 
     try {
-      this.#tcrg = tcrg;
-      if(tcrg == null) {
-        const wasmResult = await WebAssembly.instantiateStreaming(fetch(this.#wasmUrl, { signal: controller.signal }));
-        this.#tcrg = wasmResult.instance;
+      if(wasmModulePromise == null) {
+        wasmModulePromise = WebAssembly.compileStreaming(fetch(this.#wasmUrl, { signal: this.#abortController.signal }));
       }
 
+      if(this.#abortController.signal.aborted) {
+        return;
+      }
+
+      const module = await wasmModulePromise;
+      const wasmResult = await WebAssembly.instantiate(module);
+      this.#tcrg = wasmResult.instance;
+
+      this.#transport = new WebTransport(this.#transportUrl); 
       await this.#transport.ready;
 
-      if(controller.signal.aborted) {
-        transport.close();
+      if(this.#abortController.signal.aborted) {
+        this.#transport.close();
         return;
       }
 
       this.#tcrg.exports.tcrg_set_rand_seed(Date.now() >>> 0);
-      this.#transport = new WebTransport(this.#transportUrl); 
-
       this.#isListening = true;
       this.#handleDisconnect(this.#transport);
       this.#ingest();
@@ -54,23 +59,49 @@ export class TcrgClient extends EventTarget {
   }
 
   async #ingest() {
-    const exports = this.#tcrg.exports;
-    const bufferPtr = exports.tcrg_get_buf();
+    // changes to make
+    // i have a js owned arraybuffer(BUF_CAP) 
+    // and a wasm owned view (BUF_CAP)
+    // and after i receive "value" which is just that filled arraybuffer, 
+    // i copy my "value" bytes into the wasm owned view, 
+    // accounting for an offset 
+    // until the byob read returns done === true
 
+    const exports = this.#tcrg.exports;
+    const bufPtr = exports.tcrg_get_buf();
+    const bufCap = exports.tcrg_get_buf_cap();
+    const bufView = new Uint8Array(exports.memory.buffer, bufPtr, bufCap);
+
+    let tmpBuf = new ArrayBuffer(bufcap);
     try {
       const sessionReader = this.#transport.incomingUnidirectionalStreams.getReader();
 
       while(this.#isListening) {
-        const { value: receiveStream, done: sessionDone } = await sessionReader.read();
+        const { value: stream, done: sessionDone } = await sessionReader.read();
         if(sessionDone) break;
-        const byobReader = receiveStream.readable.getReader({ mode: "byob" });
-        while(this.#isListening) {
-          const bufferLen = exports.tcrg_get_buf_len();
-          const view = new Uint8Array(exports.memory.buffer, bufferPtr, bufferLen);
-          const {value, done: streamDone } = await byobReader.read(view);
-          if(streamDone) break;
 
-          exports.tcrg_set_nebv(value.byteLength);
+        const byobReader = receiveStream.readable.getReader({ mode: "byob" });
+        let offset = 0;
+
+        try {
+          while(this.#isListening) {
+            const tmpBufView = new Uint8Array(tmpBuf, offset);
+
+            const { value, done: streamDone } = await byobReader.read(tmpBufView);
+            if(streamDone) break;
+
+            tmpBuf = value.buffer;
+            offset += value.byteLength;
+
+            view = value;
+          }
+
+          if(offset > 16) {
+            bufView.set(new Uint8Array(tmpBuf, 0, offset));
+            exports.tcrg_on_set_nebv(value.byteLength);
+          }
+        } finally {
+          reader.releaseLock();
         }
       }
     } catch (error) {
