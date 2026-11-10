@@ -1,2 +1,5 @@
 node_modules
 *.wasm
+judge/bin/
+*bin/
+*build/
